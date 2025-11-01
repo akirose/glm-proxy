@@ -98,6 +98,17 @@ def log_request_beautifully(method: str, path: str, model: str, num_messages: in
 
 app = FastAPI()
 
+@app.on_event("startup")
+async def startup_event():
+    """Print startup information when the server starts."""
+    port = int(os.environ.get("PORT", 8082))
+    print(f"\n{Colors.BOLD}{Colors.GREEN}🚀 GLM Proxy Server{Colors.RESET}")
+    print(f"{Colors.CYAN}Port:{Colors.RESET} {port}")
+    print(f"{Colors.CYAN}Backend:{Colors.RESET} {OPENAI_BASE_URL}")
+    print(f"{Colors.CYAN}Log Level:{Colors.RESET} {logging.getLevelName(logger.getEffectiveLevel())}")
+    print(f"{Colors.CYAN}Think Filter:{Colors.RESET} {'Enabled' if ENABLE_THINK_FILTER else 'Disabled'}")
+    sys.stdout.flush()
+
 # Middleware to log all requests
 @app.middleware("http")
 async def log_requests(request: Request, call_next):
@@ -134,6 +145,9 @@ async def validation_exception_handler(request: Request, exc: RequestValidationE
 # Get API keys from environment
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
 OPENAI_BASE_URL = os.environ.get("OPENAI_BASE_URL", "http://127.0.0.1:1234/v1")
+
+# Think filter configuration
+ENABLE_THINK_FILTER = os.environ.get("ENABLE_THINK_FILTER", "0") == "1"
 
 # GLM Tool Parser for handling GLM-4's tool call format
 class GLMToolParser:
@@ -264,6 +278,43 @@ class GLMToolParser:
 
 # Create global GLM tool parser instance
 glm_tool_parser = GLMToolParser()
+
+# Think tag filter
+class ThinkTagFilter:
+    """Filter for removing <think> tags and their content from model outputs."""
+
+    def __init__(self):
+        # Regex pattern for matching <think>...</think> blocks
+        self.think_tag_regex = re.compile(r"<think>.*?</think>", re.DOTALL)
+        self.think_start_token = "<think>"
+        self.think_end_token = "</think>"
+        logger.debug("ThinkTagFilter initialized")
+
+    def filter_content(self, content: str) -> str:
+        """Remove all <think>...</think> blocks from content.
+
+        Args:
+            content: Text that may contain think tags
+
+        Returns:
+            Content with all think tags and their content removed
+        """
+        if not content:
+            return content
+
+        # Remove all complete think tag blocks
+        filtered = self.think_tag_regex.sub("", content)
+
+        # Handle incomplete think tags (started but not yet closed)
+        think_start_idx = filtered.find(self.think_start_token)
+        if think_start_idx != -1:
+            # Incomplete think tag, remove everything from the start token onwards
+            filtered = filtered[:think_start_idx]
+
+        return filtered
+
+# Create global think tag filter instance
+think_filter = ThinkTagFilter()
 
 # OpenAI API Models
 class FunctionCall(BaseModel):
@@ -421,20 +472,32 @@ async def call_openai_api(request: ChatCompletionRequest) -> Union[ChatCompletio
             for choice in response_data["choices"]:
                 message = choice.get("message", {})
                 content = message.get("content", "")
-                
+
                 if content and glm_tool_parser.tool_call_start_token in content:
                     # Parse GLM tool calls
                     text_content, tool_calls = glm_tool_parser.extract_content_and_tools(content)
-                    
+
                     # Update message with parsed content
                     message["content"] = text_content if text_content else None
-                    
+
                     if tool_calls:
                         message["tool_calls"] = tool_calls
                         # Update finish reason to tool_calls if tools were found
                         choice["finish_reason"] = "tool_calls"
 
                     logger.debug(f"GLM Parser: Converted {len(tool_calls)} tool calls to OpenAI format")
+
+        # Apply think filter if enabled
+        if ENABLE_THINK_FILTER and response_data.get("choices"):
+            for choice in response_data["choices"]:
+                message = choice.get("message", {})
+                content = message.get("content", "")
+
+                if content and think_filter.think_start_token in content:
+                    # Filter out think tags
+                    filtered_content = think_filter.filter_content(content)
+                    message["content"] = filtered_content if filtered_content else None
+                    logger.debug(f"Think Filter: Filtered content from {len(content)} to {len(filtered_content)} chars")
 
         return response_data
 
@@ -503,8 +566,8 @@ async def handle_streaming_response(base_url: str,
                             try:
                                 chunk_data = json.loads(data_str)
 
-                                # Handle GLM models - filter out tool call XML content
-                                if is_glm:
+                                # Process content with filters (GLM tool calls and/or think tags)
+                                if is_glm or ENABLE_THINK_FILTER:
                                     choices = chunk_data.get("choices", [])
 
                                     # Process only the first choice (standard for streaming)
@@ -516,16 +579,30 @@ async def handle_streaming_response(base_url: str,
                                             # Accumulate content from this chunk
                                             accumulated_content += delta["content"]
 
-                                            # Remove all <tool_call>...</tool_call> blocks from accumulated content
                                             clean_content = accumulated_content
-                                            # Use regex to remove all complete tool call blocks
-                                            clean_content = glm_tool_parser.func_call_regex.sub("", clean_content)
 
-                                            # Also handle incomplete tool calls (started but not yet closed)
-                                            tool_start_idx = clean_content.find(glm_tool_parser.tool_call_start_token)
-                                            if tool_start_idx != -1:
-                                                # Incomplete tool call, remove everything from the start token onwards
-                                                clean_content = clean_content[:tool_start_idx]
+                                            # Apply GLM tool call filter if GLM model
+                                            if is_glm:
+                                                # Remove all <tool_call>...</tool_call> blocks from accumulated content
+                                                # Use regex to remove all complete tool call blocks
+                                                clean_content = glm_tool_parser.func_call_regex.sub("", clean_content)
+
+                                                # Also handle incomplete tool calls (started but not yet closed)
+                                                tool_start_idx = clean_content.find(glm_tool_parser.tool_call_start_token)
+                                                if tool_start_idx != -1:
+                                                    # Incomplete tool call, remove everything from the start token onwards
+                                                    clean_content = clean_content[:tool_start_idx]
+
+                                            # Apply think filter if enabled
+                                            if ENABLE_THINK_FILTER:
+                                                # Remove all <think>...</think> blocks
+                                                clean_content = think_filter.think_tag_regex.sub("", clean_content)
+
+                                                # Also handle incomplete think tags (started but not yet closed)
+                                                think_start_idx = clean_content.find(think_filter.think_start_token)
+                                                if think_start_idx != -1:
+                                                    # Incomplete think tag, remove everything from the start token onwards
+                                                    clean_content = clean_content[:think_start_idx]
 
                                             # Determine new content to send (only what we haven't sent yet)
                                             content_to_send = clean_content[sent_length:]
@@ -535,16 +612,16 @@ async def handle_streaming_response(base_url: str,
                                                 chunk_data["choices"][0]["delta"] = {"content": content_to_send}
                                                 sent_length = len(clean_content)
                                                 yield f"data: {json.dumps(chunk_data)}\n\n"
-                                                logger.debug(f"GLM Stream: Sent {len(content_to_send)} chars (total sent: {sent_length})")
+                                                logger.debug(f"Stream Filter: Sent {len(content_to_send)} chars (total sent: {sent_length})")
                                             # If no new content, don't send anything
                                         else:
                                             # No content in delta, forward as-is (might be role or other metadata)
                                             yield f"data: {json.dumps(chunk_data)}\n\n"
 
-                                    # Don't send original chunk for GLM models - already processed
+                                    # Don't send original chunk for filtered models - already processed
                                     continue
 
-                                # Forward the chunk as-is (for non-GLM models)
+                                # Forward the chunk as-is (for non-filtered models)
                                 yield f"data: {json.dumps(chunk_data)}\n\n"
 
                             except json.JSONDecodeError:
@@ -604,10 +681,5 @@ async def chat_completions(request: ChatCompletionRequest):
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8082))
-    print(f"\n{Colors.BOLD}{Colors.GREEN}🚀 GLM Proxy Server{Colors.RESET}")
-    print(f"{Colors.CYAN}Port:{Colors.RESET} {port}")
-    print(f"{Colors.CYAN}Backend:{Colors.RESET} {OPENAI_BASE_URL}")
-    print(f"{Colors.CYAN}Log Level:{Colors.RESET} {logging.getLevelName(logger.level)}")
-    print(f"{Colors.DIM}Set logging.basicConfig level to DEBUG for detailed logs{Colors.RESET}\n")
     uvicorn.run(app, host="0.0.0.0", port=port, log_level="warning")
 
