@@ -164,9 +164,10 @@ class GLMToolParser:
     def __init__(self):
         self.tool_call_start_token = "<tool_call>"
         self.tool_call_end_token = "</tool_call>"
-        
+
         # Regex patterns for parsing GLM tool calls
-        self.func_call_regex = re.compile(r"<tool_call>.*?</tool_call>", re.DOTALL)
+        # Match tool call blocks with trailing whitespace to keep output clean
+        self.func_call_regex = re.compile(r"<tool_call>.*?</tool_call>\s*", re.DOTALL)
         self.func_detail_regex = re.compile(
             r"<tool_call>([^\n]*)\n(.*)</tool_call>", re.DOTALL
         )
@@ -284,8 +285,9 @@ class ThinkTagFilter:
     """Filter for removing <think> tags and their content from model outputs."""
 
     def __init__(self):
-        # Regex pattern for matching <think>...</think> blocks
-        self.think_tag_regex = re.compile(r"<think>.*?</think>", re.DOTALL)
+        # Regex pattern for matching <think>...</think> blocks with trailing whitespace
+        # This ensures that newlines/spaces after think tags are also removed
+        self.think_tag_regex = re.compile(r"<think>.*?</think>\s*", re.DOTALL)
         self.think_start_token = "<think>"
         self.think_end_token = "</think>"
         logger.debug("ThinkTagFilter initialized")
@@ -309,7 +311,8 @@ class ThinkTagFilter:
         think_start_idx = filtered.find(self.think_start_token)
         if think_start_idx != -1:
             # Incomplete think tag, remove everything from the start token onwards
-            filtered = filtered[:think_start_idx]
+            # Also strip trailing whitespace before the incomplete tag
+            filtered = filtered[:think_start_idx].rstrip()
 
         return filtered
 
@@ -591,7 +594,8 @@ async def handle_streaming_response(base_url: str,
                                                 tool_start_idx = clean_content.find(glm_tool_parser.tool_call_start_token)
                                                 if tool_start_idx != -1:
                                                     # Incomplete tool call, remove everything from the start token onwards
-                                                    clean_content = clean_content[:tool_start_idx]
+                                                    # Also strip trailing whitespace before the incomplete tag
+                                                    clean_content = clean_content[:tool_start_idx].rstrip()
 
                                             # Apply think filter if enabled
                                             if ENABLE_THINK_FILTER:
@@ -602,7 +606,8 @@ async def handle_streaming_response(base_url: str,
                                                 think_start_idx = clean_content.find(think_filter.think_start_token)
                                                 if think_start_idx != -1:
                                                     # Incomplete think tag, remove everything from the start token onwards
-                                                    clean_content = clean_content[:think_start_idx]
+                                                    # Also strip trailing whitespace before the incomplete tag
+                                                    clean_content = clean_content[:think_start_idx].rstrip()
 
                                             # Determine new content to send (only what we haven't sent yet)
                                             content_to_send = clean_content[sent_length:]
